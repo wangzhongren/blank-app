@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py —— 修复优化版（2025年12月10日）
-# 修复了注意力计算中的轴错误、相似度排序bug，并移除优先规则以忠实复现论文机制
-# 现在 "hello how are you" 稳定预测 "am"，完美匹配论文例子
+# app.py —— 带种子调节的动态语义原型可视化器（2025年12月10日）
+# 基于 Wang (2025): "AI = Dynamic Categorization"
+# 支持实时调整 QKV 投影种子，观察 Transformer 如何动态构建语义原型
 
 import streamlit as st
 import numpy as np
@@ -15,6 +15,23 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="expanded"
 )
+
+# ============================ 侧边栏：QKV 种子控制 ============================
+with st.sidebar:
+    st.header("⚙️ 模型参数")
+    seed_proj = st.slider(
+        "QKV 投影种子 (seed)",
+        min_value=0,
+        max_value=100,
+        value=1,  # 论文推荐值
+        help="改变此值会重新生成 Q/K/V 投影矩阵，影响注意力行为"
+    )
+    st.info(f"当前 seed = {seed_proj}")
+    st.markdown("""
+    - **seed=1**：通常生成合理对话（如 `you → ?`）  
+    - **seed=42**：可能生成“乱序”（如 `you → am`）  
+    - 尝试不同值，观察原型和预测如何变化！
+    """)
 
 # ============================ 标题区 ============================
 st.title("🧠 Transformer 真的在想什么？")
@@ -30,23 +47,23 @@ st.divider()
 VOCAB = ["hello", "hi", "how", "are", "you", "?", "I", "am", "fine", "!", "bye", "see", "later"]
 EMB_DIM = 16
 
-# 预计算词向量（带语义结构 + 小噪声）
+# 固定词嵌入（seed=0 保证跨运行一致性）
 np.random.seed(0)
 def make_embedding(word):
     base = np.zeros(EMB_DIM)
-    if word in ["hello", "hi"]: base[0] = 1.0 # 问候
-    elif word in ["how", "are", "you"]: base[1] = 1.0 # 提问
-    elif word in ["I", "am", "fine"]: base[2] = 1.0 # 自我陈述
-    elif word in ["bye", "see", "later"]: base[3] = 1.0 # 告别
-    elif word in ["?", "!"]: base[4] = 1.0 # 标点
-    else: base[5] = 1.0 # 其他
-    base += np.random.randn(EMB_DIM) * 0.05
+    if word in ["hello", "hi"]: base[0] = 1.0  # 问候
+    elif word in ["how", "are", "you"]: base[1] = 1.0  # 提问
+    elif word in ["I", "am", "fine"]: base[2] = 1.0  # 自我陈述
+    elif word in ["bye", "see", "later"]: base[3] = 1.0  # 告别
+    elif word in ["?", "!"]: base[4] = 1.0  # 标点
+    else: base[5] = 1.0  # 其他
+    base += np.random.randn(EMB_DIM) * 0.05  # 小噪声
     return base
 
 EMBEDDINGS = {w: make_embedding(w) for w in VOCAB}
 
-# 投影矩阵（模拟训练好的参数）
-np.random.seed(1)
+# 使用侧边栏 seed 生成 QKV 投影矩阵
+np.random.seed(seed_proj)
 Q_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 K_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 V_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
@@ -54,7 +71,7 @@ V_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 def predict_next(tokens):
     """预测下一个词，并返回原型、注意力权重、相似度"""
     if not tokens:
-        # 初始状态：返回 "hello"，并构造虚拟向量
+        # 初始状态
         next_word = "hello"
         dummy_proto = np.zeros(EMB_DIM)
         dummy_weights = np.array([1.0])
@@ -64,21 +81,21 @@ def predict_next(tokens):
     # 获取嵌入
     emb = np.stack([EMBEDDINGS[t] for t in tokens])
     
-    # 计算 Q, K, V
+    # QKV 投影
     Q = emb[-1:] @ Q_PROJ
     K = emb @ K_PROJ
     V = emb @ V_PROJ
     
-    # 注意力得分与权重（修复轴和数值稳定）
-    scores = Q @ K.T / np.sqrt(EMB_DIM)  # 加 scaling 更像真实 Transformer
+    # 注意力计算（带缩放和数值稳定）
+    scores = Q @ K.T / np.sqrt(EMB_DIM)
     scores = scores - np.max(scores, axis=-1, keepdims=True)
     exp_scores = np.exp(scores)
     weights = exp_scores / (np.sum(exp_scores, axis=-1, keepdims=True) + 1e-8)
     prototype = (weights @ V).flatten()
     
-    # 计算与所有词的余弦相似度
+    # 余弦相似度
     sims = np.array([
-        np.dot(prototype, EMBEDDINGS[w]) / 
+        np.dot(prototype, EMBEDDINGS[w]) /
         (np.linalg.norm(prototype) * np.linalg.norm(EMBEDDINGS[w]) + 1e-8)
         for w in VOCAB
     ])
@@ -86,14 +103,13 @@ def predict_next(tokens):
     # 防重复：禁止最近两个词
     banned = set(tokens[-2:]) if len(tokens) >= 2 else {tokens[-1]}
     
-    # 按相似度排序选第一个未被 ban 的（移除优先规则，忠实论文）
+    # 按相似度排序，选第一个未被 ban 的
     sorted_indices = np.argsort(-sims)
     for idx in sorted_indices:
         w = VOCAB[idx]
         if w not in banned:
             return w, prototype, weights.flatten(), sims
     
-    # 万不得已返回 "!"
     return "!", prototype, weights.flatten(), sims
 
 # ============================ 用户交互区 ============================
@@ -107,7 +123,7 @@ if not prompt.strip():
     st.info("请输入至少一个词以启动生成。")
     st.stop()
 
-# 过滤并标准化输入
+# 过滤输入
 tokens = [t.lower() for t in prompt.strip().split() if t.lower() in VOCAB]
 if not tokens:
     st.error("⚠️ 所有输入词必须来自词汇表！支持的词：" + ", ".join(VOCAB))
@@ -120,7 +136,7 @@ next_word, prototype, attn_weights, similarities = predict_next(tokens)
 col1, col2 = st.columns(2)
 
 with col1:
-    # 1. 注意力热力图
+    # 注意力热力图
     fig_att = px.imshow(
         attn_weights.reshape(1, -1),
         labels=dict(x="历史 token", y="", color="注意力权重"),
@@ -132,7 +148,7 @@ with col1:
     fig_att.update_layout(title="1. 注意力权重（它正在关注哪里）", height=300)
     st.plotly_chart(fig_att, use_container_width=True)
     
-    # 3. 相似度条形图
+    # 相似度条形图
     fig_bar = go.Figure(go.Bar(
         x=VOCAB,
         y=similarities,
@@ -148,7 +164,7 @@ with col1:
     st.plotly_chart(fig_bar, use_container_width=True)
 
 with col2:
-    # 2. 原型雷达图（仅前6个语义维度）
+    # 语义原型雷达图（前6维）
     semantic_labels = ["Greeting", "Question", "Self", "Farewell", "Punctuation", "Other"]
     fig_radar = go.Figure(data=go.Scatterpolar(
         r=prototype[:6],
@@ -164,7 +180,7 @@ with col2:
     st.plotly_chart(fig_radar, use_container_width=True)
 
 # ============================ 结果展示 ============================
-st.success(f"预测结果： `{prompt}` → **{next_word}**")
+st.success(f"预测结果：`{prompt}` → **{next_word}** (seed={seed_proj})")
 st.balloons()
 
 # ============================ 页脚 ============================
