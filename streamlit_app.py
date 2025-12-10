@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# app.py   ← 直接把下面全部内容复制进 Streamlit 的编辑器
+# app.py —— 修复优化版（2025年12月10日）
 
 import streamlit as st
 import numpy as np
@@ -25,125 +25,170 @@ st.markdown("""
 
 st.divider()
 
-# ============================ 核心代码（Fully Fixed v2 精简美化版） ============================
+# ============================ 核心模型定义 ============================
 
 VOCAB = ["hello", "hi", "how", "are", "you", "?", "I", "am", "fine", "!", "bye", "see", "later"]
-
 EMB_DIM = 16
-np.random.seed(0)
 
+# 预计算词向量（带语义结构 + 小噪声）
+np.random.seed(0)
 def make_embedding(word):
     base = np.zeros(EMB_DIM)
     if word in ["hello", "hi"]:           base[0] = 1.0   # 问候
     elif word in ["how", "are", "you"]:   base[1] = 1.0   # 提问
     elif word in ["I", "am", "fine"]:     base[2] = 1.0   # 自我陈述
     elif word in ["bye", "see", "later"]: base[3] = 1.0   # 告别
-    elif word in ["?", "!"]:              base[4] = 1.0   # 终止符
-    else:                                 base[5] = 1.0
+    elif word in ["?", "!"]:              base[4] = 1.0   # 标点
+    else:                                 base[5] = 1.0   # 其他
     base += np.random.randn(EMB_DIM) * 0.05
     return base
 
 EMBEDDINGS = {w: make_embedding(w) for w in VOCAB}
 
-# 投影矩阵（模拟学习到的参数）
+# 投影矩阵（模拟训练好的参数）
 np.random.seed(42)
 Q_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 K_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 V_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 
 def predict_next(tokens):
+    """预测下一个词，并返回原型、注意力权重、相似度"""
     if not tokens:
-        return "hello"
+        # 初始状态：返回 "hello"，并构造虚拟向量
+        next_word = "hello"
+        dummy_proto = np.zeros(EMB_DIM)
+        dummy_weights = np.array([1.0])
+        dummy_sims = [0.0] * len(VOCAB)
+        return next_word, dummy_proto, dummy_weights, dummy_sims
+
+    # 获取嵌入
     emb = np.stack([EMBEDDINGS[t] for t in tokens])
+    
+    # 计算 Q, K, V
     Q = emb[-1:] @ Q_PROJ
     K = emb @ K_PROJ
     V = emb @ V_PROJ
 
+    # 注意力得分与权重
     scores = Q @ K.T
-    scores = scores - scores.max()                    # 数值稳定
-    weights = np.exp(scores) / (np.exp(scores).sum() + 1e-8)
+    scores = scores - np.max(scores, axis=1, keepdims=True)  # 数值稳定
+    exp_scores = np.exp(scores)
+    weights = exp_scores / (np.sum(exp_scores, axis=1, keepdims=True) + 1e-8)
     prototype = (weights @ V).flatten()
 
+    # 计算与所有词的余弦相似度
     sims = []
     for w in VOCAB:
-        sim = np.dot(prototype, EMBEDDINGS[w]) / (
-            np.linalg.norm(prototype) * np.linalg.norm(EMBEDDINGS[w]) + 1e-8)
+        e_w = EMBEDDINGS[w]
+        sim = np.dot(prototype, e_w) / (np.linalg.norm(prototype) * np.linalg.norm(e_w) + 1e-8)
         sims.append(sim)
+    sims = np.array(sims)
 
-    # 简单防重复 + 鼓励结束
+    # 防重复：禁止最近两个词
     banned = set(tokens[-2:]) if len(tokens) >= 2 else {tokens[-1]}
-    for w in [VOCAB[i] for i in np.argsort(-np.array(sims))]:
-        if w not in banned:
-            # 特殊规则：你问完、我说完、告别后优先打标点
-            if tokens[-1] in ["you", "fine", "later"] and w in ["?", "!"]:
-                return w, prototype, weights.flatten(), sims
+
+    # 优先规则（增强对话逻辑）
+    if tokens[-1] == "you":
+        preferred = ["I", "am", "fine"]
+    elif tokens[-1] in ["fine", "later"]:
+        preferred = ["!"]
+    elif tokens[-1] in ["hello", "hi"]:
+        preferred = ["how", "are", "you"]
+    else:
+        preferred = []
+
+    # 先尝试 preferred
+    for w in preferred:
+        if w in VOCAB and w not in banned:
             return w, prototype, weights.flatten(), sims
 
+    # 否则按相似度排序选第一个未被 ban 的
+    for idx in np.argsort(-sims):
+        w = VOCAB[idx]
+        if w not in banned:
+            return w, prototype, weights.flatten(), sims
+
+    # 万不得已返回 "!"
     return "!", prototype, weights.flatten(), sims
 
-# ============================ 交互区 ============================
+# ============================ 用户交互区 ============================
 
 prompt = st.text_input(
-    "输入任意开头，看看 Transformer 下一秒在想什么",
+    "请输入开头（仅限以下词：hello, hi, how, are, you, I, am, fine, bye, see, later, ?, !）",
     value="hello how are you",
     key="input"
 )
 
-if prompt.strip():
-    tokens = prompt.strip().split()
-    next_word, prototype, attn_weights, similarities = predict_next(tokens)
+if not prompt.strip():
+    st.info("请输入至少一个词以启动生成。")
+    st.stop()
 
-    col1, col2 = st.columns(2)
+# 过滤并标准化输入
+tokens = [t.lower() for t in prompt.strip().split() if t.lower() in VOCAB]
+if not tokens:
+    st.error("⚠️ 所有输入词必须来自词汇表！支持的词：" + ", ".join(VOCAB))
+    st.stop()
 
-    with col1:
-        # 1. 注意力热力图
-        fig_att = px.imshow(
-            attn_weights.reshape(1, -1),
-            labels=dict(x="历史 token", y="", color="注意力权重"),
-            x=tokens,
-            text_auto=".3f",
-            color_continuous_scale="Blues",
-            aspect="auto"
-        )
-        fig_att.update_layout(title="1. 注意力权重（它正在看哪里）", height=400)
-        st.plotly_chart(fig_att, use_container_width=True)
+# 预测
+next_word, prototype, attn_weights, similarities = predict_next(tokens)
 
-        # 3. 相似度排行榜
-        fig_bar = go.Figure(go.Bar(
-            x=VOCAB,
-            y=similarities,
-            text=[f"{s:.3f}" for s in similarities],
-            textposition="outside",
-            marker_color="#FF6F61"
-        ))
-        fig_bar.update_layout(
-            title=f"3. 相似度排序 → 下一个词是 <b style='color:#FF6F61'>{next_word}</b>",
-            height=500
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+# ============================ 可视化 ============================
 
-    with col2:
-        # 2. 原型雷达图
-        fig_radar = go.Figure(data=go.Scatterpolar(
-            r=prototype,
-            theta=[f"d{i}" for i in range(16)],
-            fill='toself',
-            line_color="#636EFA"
-        ))
-        fig_radar.update_layout(
-            polar=dict(radialaxis=dict(visible=True, range=[-1, 1])),
-            title="2. 类别原型向量（它脑子里现在的临时概念）",
-            height=580
-        )
-        st.plotly_chart(fig_radar, use_container_width=True)
+col1, col2 = st.columns(2)
 
-    st.success(f"预测结果：  {prompt}  →  →  **{next_word}**")
-    st.balloons()
+with col1:
+    # 1. 注意力热力图
+    fig_att = px.imshow(
+        attn_weights.reshape(1, -1),
+        labels=dict(x="历史 token", y="", color="注意力权重"),
+        x=tokens,
+        text_auto=".2f",
+        color_continuous_scale="Blues",
+        aspect="auto"
+    )
+    fig_att.update_layout(title="1. 注意力权重（它正在关注哪里）", height=300)
+    st.plotly_chart(fig_att, use_container_width=True)
+
+    # 3. 相似度条形图
+    fig_bar = go.Figure(go.Bar(
+        x=VOCAB,
+        y=similarities,
+        text=[f"{s:.2f}" for s in similarities],
+        textposition="outside",
+        marker_color="#FF6F61"
+    ))
+    fig_bar.update_layout(
+        title=f"3. 词汇相似度 → 预测下一个词：<b style='color:#FF6F61'>{next_word}</b>",
+        height=450,
+        margin=dict(t=50, b=100)
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+with col2:
+    # 2. 原型雷达图（仅前6个语义维度）
+    semantic_labels = ["Greeting", "Question", "Self", "Farewell", "Punctuation", "Other"]
+    fig_radar = go.Figure(data=go.Scatterpolar(
+        r=prototype[:6],
+        theta=semantic_labels,
+        fill='toself',
+        line_color="#636EFA"
+    ))
+    fig_radar.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[-0.5, 1.2])),
+        title="2. 语义原型（6个动态认知维度）",
+        height=500
+    )
+    st.plotly_chart(fig_radar, use_container_width=True)
+
+# ============================ 结果展示 ============================
+
+st.success(f"预测结果：  `{prompt}`  →  **{next_word}**")
+st.balloons()
 
 # ============================ 页脚 ============================
 st.markdown("---")
 st.markdown("""
-**论文下载**：[Dynamic Semantic Categorization Through Self-Referential Attention (PDF)](https://zenodo.org/records/17835987)  
+**论文下载**：[Dynamic Semantic Categorization Through Self-Referential Attention (PDF)](https://zenodo.org/records/17835987)  
 **代码仓库**：[GitHub - wangzhongren/DynamicGPT](https://github.com/wangzhongren/DynamicGPT)
 """)
-st.caption("“AI = Dynamic Categorization” — Zhongren Wang, 2025")
+st.caption("“AI = Dynamic Categorization” — Zhongren Wang, 2025")
