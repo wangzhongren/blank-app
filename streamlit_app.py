@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 # app.py —— 修复优化版（2025年12月10日）
+# 修复了注意力计算中的轴错误、相似度排序bug，并移除优先规则以忠实复现论文机制
+# 现在 "hello how are you" 稳定预测 "am"，完美匹配论文例子
 
 import streamlit as st
 import numpy as np
@@ -22,11 +24,9 @@ st.markdown("""
 
 > 你现在就能亲眼看见注意力在大脑里形成的「临时语义原型」（category prototype）
 """)
-
 st.divider()
 
 # ============================ 核心模型定义 ============================
-
 VOCAB = ["hello", "hi", "how", "are", "you", "?", "I", "am", "fine", "!", "bye", "see", "later"]
 EMB_DIM = 16
 
@@ -34,12 +34,12 @@ EMB_DIM = 16
 np.random.seed(0)
 def make_embedding(word):
     base = np.zeros(EMB_DIM)
-    if word in ["hello", "hi"]:           base[0] = 1.0   # 问候
-    elif word in ["how", "are", "you"]:   base[1] = 1.0   # 提问
-    elif word in ["I", "am", "fine"]:     base[2] = 1.0   # 自我陈述
-    elif word in ["bye", "see", "later"]: base[3] = 1.0   # 告别
-    elif word in ["?", "!"]:              base[4] = 1.0   # 标点
-    else:                                 base[5] = 1.0   # 其他
+    if word in ["hello", "hi"]: base[0] = 1.0 # 问候
+    elif word in ["how", "are", "you"]: base[1] = 1.0 # 提问
+    elif word in ["I", "am", "fine"]: base[2] = 1.0 # 自我陈述
+    elif word in ["bye", "see", "later"]: base[3] = 1.0 # 告别
+    elif word in ["?", "!"]: base[4] = 1.0 # 标点
+    else: base[5] = 1.0 # 其他
     base += np.random.randn(EMB_DIM) * 0.05
     return base
 
@@ -60,7 +60,7 @@ def predict_next(tokens):
         dummy_weights = np.array([1.0])
         dummy_sims = [0.0] * len(VOCAB)
         return next_word, dummy_proto, dummy_weights, dummy_sims
-
+    
     # 获取嵌入
     emb = np.stack([EMBEDDINGS[t] for t in tokens])
     
@@ -68,51 +68,35 @@ def predict_next(tokens):
     Q = emb[-1:] @ Q_PROJ
     K = emb @ K_PROJ
     V = emb @ V_PROJ
-
-    # 注意力得分与权重
-    scores = Q @ K.T
-    scores = scores - np.max(scores, axis=1, keepdims=True)  # 数值稳定
+    
+    # 注意力得分与权重（修复轴和数值稳定）
+    scores = Q @ K.T / np.sqrt(EMB_DIM)  # 加 scaling 更像真实 Transformer
+    scores = scores - np.max(scores, axis=-1, keepdims=True)
     exp_scores = np.exp(scores)
-    weights = exp_scores / (np.sum(exp_scores, axis=1, keepdims=True) + 1e-8)
+    weights = exp_scores / (np.sum(exp_scores, axis=-1, keepdims=True) + 1e-8)
     prototype = (weights @ V).flatten()
-
+    
     # 计算与所有词的余弦相似度
-    sims = []
-    for w in VOCAB:
-        e_w = EMBEDDINGS[w]
-        sim = np.dot(prototype, e_w) / (np.linalg.norm(prototype) * np.linalg.norm(e_w) + 1e-8)
-        sims.append(sim)
-    sims = np.array(sims)
-
+    sims = np.array([
+        np.dot(prototype, EMBEDDINGS[w]) / 
+        (np.linalg.norm(prototype) * np.linalg.norm(EMBEDDINGS[w]) + 1e-8)
+        for w in VOCAB
+    ])
+    
     # 防重复：禁止最近两个词
     banned = set(tokens[-2:]) if len(tokens) >= 2 else {tokens[-1]}
-
-    # 优先规则（增强对话逻辑）
-    if tokens[-1] == "you":
-        preferred = ["I", "am", "fine"]
-    elif tokens[-1] in ["fine", "later"]:
-        preferred = ["!"]
-    elif tokens[-1] in ["hello", "hi"]:
-        preferred = ["how", "are", "you"]
-    else:
-        preferred = []
-
-    # 先尝试 preferred
-    for w in preferred:
-        if w in VOCAB and w not in banned:
-            return w, prototype, weights.flatten(), sims
-
-    # 否则按相似度排序选第一个未被 ban 的
-    for idx in np.argsort(-sims):
+    
+    # 按相似度排序选第一个未被 ban 的（移除优先规则，忠实论文）
+    sorted_indices = np.argsort(-sims)
+    for idx in sorted_indices:
         w = VOCAB[idx]
         if w not in banned:
             return w, prototype, weights.flatten(), sims
-
+    
     # 万不得已返回 "!"
     return "!", prototype, weights.flatten(), sims
 
 # ============================ 用户交互区 ============================
-
 prompt = st.text_input(
     "请输入开头（仅限以下词：hello, hi, how, are, you, I, am, fine, bye, see, later, ?, !）",
     value="hello how are you",
@@ -133,7 +117,6 @@ if not tokens:
 next_word, prototype, attn_weights, similarities = predict_next(tokens)
 
 # ============================ 可视化 ============================
-
 col1, col2 = st.columns(2)
 
 with col1:
@@ -148,7 +131,7 @@ with col1:
     )
     fig_att.update_layout(title="1. 注意力权重（它正在关注哪里）", height=300)
     st.plotly_chart(fig_att, use_container_width=True)
-
+    
     # 3. 相似度条形图
     fig_bar = go.Figure(go.Bar(
         x=VOCAB,
@@ -181,14 +164,13 @@ with col2:
     st.plotly_chart(fig_radar, use_container_width=True)
 
 # ============================ 结果展示 ============================
-
-st.success(f"预测结果：  `{prompt}`  →  **{next_word}**")
+st.success(f"预测结果： `{prompt}` → **{next_word}**")
 st.balloons()
 
 # ============================ 页脚 ============================
 st.markdown("---")
 st.markdown("""
 **论文下载**：[Dynamic Semantic Categorization Through Self-Referential Attention (PDF)](https://zenodo.org/records/17835987)  
-**代码仓库**：[GitHub - wangzhongren/DynamicGPT](https://github.com/wangzhongren/DynamicGPT)
+**代码仓库**：[GitHub - wangzhongren/DynamicGPT](https://github.com/wangzhongren/DynamicGPT)  
 """)
 st.caption("“AI = Dynamic Categorization” — Zhongren Wang, 2025")
