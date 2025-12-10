@@ -46,7 +46,7 @@ def make_embedding(word):
 EMBEDDINGS = {w: make_embedding(w) for w in VOCAB}
 
 # 投影矩阵（模拟训练好的参数）
-np.random.seed(42)
+np.random.seed(1)
 Q_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 K_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
 V_PROJ = np.random.randn(EMB_DIM, EMB_DIM) * 0.3
